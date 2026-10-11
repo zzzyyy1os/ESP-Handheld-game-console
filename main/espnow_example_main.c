@@ -28,164 +28,15 @@
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_crc.h"
-#include "esp_rom_sys.h"
 #include "espnow_example.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "driver/i2c_master.h"
 #include "oled.h"
+#include "rocker.h"
+#include "button.h"
 
 #define ESPNOW_MAXDELAY 512
 
 static const char *TAG = "espnow_example";
-
-/* ADC Configuration */
-#define ADC_CHANNELS       4
-#define ADC_ATTEN          ADC_ATTEN_DB_12
-#define ADC_BITWIDTH       ADC_BITWIDTH_12
-#define ADC_DEADZONE       120    /* 死区范围，中心附近视为0 */
-
-/* 各通道静止时的中心值 (根据实际测量) */
-static const int adc_center[ADC_CHANNELS] = {
-    1942,  /* CH0: LX */
-    1997,  /* CH1: LY */
-    1910,  /* CH2: RY */
-    1968,  /* CH3: RX */
-};
-#define OUTPUT_MAX         100    /* 输出最大值 */
-
-/* ADC1 Channel to GPIO mapping for ESP32-S3:
- *   ADC1_CH6 -> GPIO7 -> LX (左摇杆X轴)
- *   ADC1_CH7 -> GPIO8 -> LY (左摇杆Y轴)
- *   ADC1_CH4 -> GPIO5 -> RY (右摇杆Y轴)
- *   ADC1_CH5 -> GPIO6 -> RX (右摇杆X轴)
- */
-static const adc_channel_t adc_channels[ADC_CHANNELS] = {
-    ADC_CHANNEL_6,  // GPIO7 -> LX
-    ADC_CHANNEL_7,  // GPIO8 -> LY
-    ADC_CHANNEL_4,  // GPIO5 -> RY
-    ADC_CHANNEL_5,  // GPIO6 -> RX
-};
-
-static adc_oneshot_unit_handle_t adc1_handle = NULL;
-static adc_cali_handle_t adc_cali_handles[ADC_CHANNELS] = {NULL};
-
-/* ADC calibration init */
-static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel,
-                                  adc_atten_t atten, adc_cali_handle_t *out_handle)
-{
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    adc_cali_curve_fitting_config_t cali_config = {
-        .unit_id = unit,
-        .chan = channel,
-        .atten = atten,
-        .bitwidth = ADC_BITWIDTH,
-    };
-    return (adc_cali_create_scheme_curve_fitting(&cali_config, out_handle) == ESP_OK);
-#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    adc_cali_line_fitting_config_t cali_config = {
-        .unit_id = unit,
-        .chan = channel,
-        .atten = atten,
-        .bitwidth = ADC_BITWIDTH,
-    };
-    return (adc_cali_create_scheme_line_fitting(&cali_config, out_handle) == ESP_OK);
-#else
-    return false;
-#endif
-}
-
-/* ADC initialization */
-static void adc_init(void)
-{
-    /* ADC1 Init */
-    adc_oneshot_unit_init_cfg_t init_config = {
-        .unit_id = ADC_UNIT_1,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
-
-    /* Configure each channel */
-    adc_oneshot_chan_cfg_t chan_config = {
-        .atten = ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH,
-    };
-
-    for (int i = 0; i < ADC_CHANNELS; i++) {
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, adc_channels[i], &chan_config));
-        /* Init calibration */
-        if (!adc_calibration_init(ADC_UNIT_1, adc_channels[i], ADC_ATTEN, &adc_cali_handles[i])) {
-            ESP_LOGW(TAG, "ADC calibration failed for channel %d (GPIO%d)", i, i + 1);
-        }
-    }
-
-    ESP_LOGI(TAG, "ADC initialized: LX=GPIO7, LY=GPIO8, RY=GPIO5, RX=GPIO6");
-}
-
-/* Map ADC raw value to -100 ~ +100 */
-static int map_adc_to_range(int raw, int ch)
-{
-    int center = adc_center[ch];
-    int diff = raw - center;
-
-    /* 死区处理：中心附近视为0 */
-    if (diff > -ADC_DEADZONE && diff < ADC_DEADZONE) {
-        return 0;
-    }
-
-    /* 正方向映射 */
-    if (diff > 0) {
-        int mapped = (diff - ADC_DEADZONE) * OUTPUT_MAX / (4095 - center - ADC_DEADZONE);
-        return (mapped > OUTPUT_MAX) ? OUTPUT_MAX : mapped;
-    }
-
-    /* 负方向映射 */
-    int mapped = (-diff - ADC_DEADZONE) * OUTPUT_MAX / (center - ADC_DEADZONE);
-    return (mapped > OUTPUT_MAX) ? -OUTPUT_MAX : -mapped;
-}
-
-/* Shared joystick values for OLED display */
-static volatile int joy_lx = 0, joy_ly = 0, joy_ry = 0, joy_rx = 0;
-
-/* Read ADC values, map to -100~+100, and log via serial */
-static void adc_read_task(void *pvParameter)
-{
-    int raw[ADC_CHANNELS];
-    const int samples = 32;  /* 每通道采样次数 */
-
-    while (1) {
-        /* 每个通道独立连续采样，采样完再切下一个通道 */
-        int sum[ADC_CHANNELS] = {0};
-        for (int i = 0; i < ADC_CHANNELS; i++) {
-            esp_rom_delay_us(500);  /* 切换通道前等待500us */
-            for (int s = 0; s < samples; s++) {
-                int val;
-                ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, adc_channels[i], &val));
-                sum[i] += val;
-            }
-        }
-        for (int i = 0; i < ADC_CHANNELS; i++) {
-            raw[i] = sum[i] / samples;
-        }
-
-        /* 映射到 -100 ~ +100 */
-        int lx = map_adc_to_range(raw[0], 0);  // GPIO7 -> LX
-        int ly = map_adc_to_range(raw[1], 1);  // GPIO8 -> LY
-        int ry = -map_adc_to_range(raw[2], 2); // GPIO5 -> RY (反转)
-        int rx = -map_adc_to_range(raw[3], 3); // GPIO6 -> RX (反转)
-
-        /* 更新共享变量 */
-        joy_lx = lx;
-        joy_ly = ly;
-        joy_ry = ry;
-        joy_rx = rx;
-
-        /* 临时调试：打印原始值，确定RX/RY的中心值 */
-        ESP_LOGI(TAG, "raw: %4d %4d %4d %4d", raw[0], raw[1], raw[2], raw[3]);
-
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
 
 static QueueHandle_t s_example_espnow_queue = NULL;
 
@@ -552,12 +403,55 @@ static void oled_i2c_init(void)
     ESP_LOGI(TAG, "I2C initialized: SDA=GPIO%d, SCL=GPIO%d", OLED_I2C_SDA_IO, OLED_I2C_SCL_IO);
 }
 
-/* OLED display task */
+/* 摇杆采样任务 */
+static void rocker_task(void *pvParameter)
+{
+    rocker_value_t val;
+    rocker_init();
+
+    while (1) {
+        rocker_read(&val);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/* 按键扫描任务 */
+static void button_task(void *pvParameter)
+{
+    static const char *evt_name[] = { "none", "short press", "long press", "double click" };
+    static const char *BTN_TAG = "button";
+    Key_Init();
+    int status_cnt = 0;
+
+    while (1) {
+        Key_Scan();
+        for (int i = 0; i < KEY_NUM; i++) {
+            KeyEvent_t e = Key_GetEvent((KeyId_t)i);
+            if (e != KEY_EVENT_NONE) {
+                ESP_LOGI(BTN_TAG, "KEY_%d: %s", i + 1, evt_name[e]);
+            }
+        }
+
+        /* 每500ms打印一次按键引脚状态 (诊断用) */
+        if (++status_cnt >= 50) {
+            status_cnt = 0;
+            ESP_LOGI(BTN_TAG, "keys: %d %d %d %d",
+                Key_IsPressed(KEY_1), Key_IsPressed(KEY_2),
+                Key_IsPressed(KEY_3), Key_IsPressed(KEY_4));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* OLED显示任务 */
 static void oled_task(void *pvParameter)
 {
     /* Wait for OLED power stable */
     vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "OLED init start, bus_handle=%p", (void *)oled_i2c_bus_handle);
     OLED_Init(oled_i2c_bus_handle);
+    ESP_LOGI(TAG, "OLED init done");
 
     /* Static labels */
     OLED_Clear();
@@ -570,16 +464,19 @@ static void oled_task(void *pvParameter)
     OLED_Display();
 
     while (1) {
+        rocker_value_t val;
+        rocker_get(&val);
+
         /* Update dynamic values */
         OLED_ClearArea(24, 16, 36, 8);
         OLED_ClearArea(88, 16, 36, 8);
         OLED_ClearArea(24, 32, 36, 8);
         OLED_ClearArea(88, 32, 36, 8);
 
-        OLED_ShowNum(24, 16, joy_lx, 4);
-        OLED_ShowNum(88, 16, joy_ly, 4);
-        OLED_ShowNum(24, 32, joy_ry, 4);
-        OLED_ShowNum(88, 32, joy_rx, 4);
+        OLED_ShowNum(24, 16, val.lx, 4);
+        OLED_ShowNum(88, 16, val.ly, 4);
+        OLED_ShowNum(24, 32, val.ry, 4);
+        OLED_ShowNum(88, 32, val.rx, 4);
 
         OLED_Display();
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -588,6 +485,10 @@ static void oled_task(void *pvParameter)
 
 void app_main(void)
 {
+    /* 串口只输出按键信息：屏蔽其他模块日志 */
+    esp_log_level_set("*", ESP_LOG_NONE);
+    esp_log_level_set("button", ESP_LOG_INFO);
+
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -596,14 +497,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
-    // Initialize ADC (4 channels: GPIO7-10)
-    adc_init();
-
     // Initialize I2C for OLED
     oled_i2c_init();
 
-    // Start ADC reading task
-    xTaskCreate(adc_read_task, "adc_read_task", 4096, NULL, 5, NULL);
+    // Start rocker sampling task
+    xTaskCreate(rocker_task, "rocker_task", 4096, NULL, 5, NULL);
+
+    // Start button scan task
+    xTaskCreate(button_task, "button_task", 3072, NULL, 5, NULL);
 
     // Start OLED display task
     xTaskCreate(oled_task, "oled_task", 4096, NULL, 3, NULL);

@@ -145,7 +145,7 @@ static const uint8_t oled_font_6x8[][6] = {
 static esp_err_t OLED_WriteCmd(uint8_t cmd)
 {
     uint8_t buf[2] = {OLED_CONTROL_CMD, cmd};
-    return i2c_master_transmit(oled_handle, buf, 2, 100);
+    return i2c_master_transmit(oled_handle, buf, 2, OLED_I2C_TIMEOUT_MS);
 }
 
 /* Private function: send data */
@@ -159,7 +159,7 @@ static esp_err_t OLED_WriteData(uint8_t *data, uint16_t size)
         uint16_t chunk = size - sent;
         if (chunk > 128) chunk = 128;
         memcpy(&buf[1], &data[sent], chunk);
-        esp_err_t ret = i2c_master_transmit(oled_handle, buf, chunk + 1, 100);
+        esp_err_t ret = i2c_master_transmit(oled_handle, buf, chunk + 1, OLED_I2C_TIMEOUT_MS);
         if (ret != ESP_OK) return ret;
         sent += chunk;
     }
@@ -173,7 +173,7 @@ void OLED_Init(i2c_master_bus_handle_t bus_handle)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = OLED_I2C_ADDR,
-        .scl_speed_hz = 400000,
+        .scl_speed_hz = OLED_I2C_SCL_HZ,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg, &oled_handle));
 
@@ -190,7 +190,7 @@ void OLED_Init(i2c_master_bus_handle_t bus_handle)
     OLED_WriteCmd(SSD1306_CMD_SET_COM_PINS);            /* 0xDA */
     OLED_WriteCmd(0x12);                                 /* Alternative COM pin config */
     OLED_WriteCmd(SSD1306_CMD_SET_CONTRAST);            /* 0x81 */
-    OLED_WriteCmd(0xCF);                                 /* Contrast = 0xCF */
+    OLED_WriteCmd(OLED_CONTRAST);
     OLED_WriteCmd(SSD1306_CMD_SET_OSC_FREQ);            /* 0xD5 */
     OLED_WriteCmd(0x80);                                 /* Default clock */
     OLED_WriteCmd(SSD1306_CMD_SET_CHARGE_PUMP);         /* 0x8D */
