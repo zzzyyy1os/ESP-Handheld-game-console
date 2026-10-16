@@ -16,6 +16,11 @@
 #include <time.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
+
+/* 喇叭音量 (0-100), 修改此处调音量 */
+#define SPK_TEST_VOLUME   5
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
@@ -33,6 +38,7 @@
 #include "oled.h"
 #include "rocker.h"
 #include "button.h"
+#include "max98357a.h"
 
 #define ESPNOW_MAXDELAY 512
 
@@ -483,11 +489,93 @@ static void oled_task(void *pvParameter)
     }
 }
 
+/* 扬声器诊断任务 (fw v3): 每 5s 一轮 = 0.4s 50Hz 方波嗡嗡测试 + 0.5s 440Hz 音调测试 */
+static void spk_test_task(void *pvParameter)
+{
+    static const char *STAG = "spk_test";
+    const int sample_rate = MAX98357A_DEFAULT_SAMPLE_RATE;   /* 32000 */
+    const int fade_frames = 160;        /* 首尾各 5ms 淡入淡出 @32kHz */
+
+    vTaskDelay(pdMS_TO_TICKS(1000));   /* 等系统稳定 */
+    MAX98357A_Init(sample_rate);
+    MAX98357A_SetVolume(SPK_TEST_VOLUME);
+    ESP_LOGI(STAG, "fw v3 diag start: buzz 50Hz square + tone 440Hz sine, vol=%d", SPK_TEST_VOLUME);
+
+    #define BEEP_CHUNK_FRAMES 1024
+    static int16_t buf[BEEP_CHUNK_FRAMES * 2];
+    int cycle = 0;
+
+    while (1) {
+        /* --- 1) 嗡嗡测试: 50Hz 方波 ±30000, 0.4s (功放/喇叭活着就该很响) --- */
+        int total = sample_rate * 400 / 1000;
+        int sent = 0;
+        bool ok = true;
+        while (sent < total) {
+            int n = total - sent;
+            if (n > BEEP_CHUNK_FRAMES) {
+                n = BEEP_CHUNK_FRAMES;
+            }
+            for (int i = 0; i < n; i++) {
+                int idx = sent + i;
+                int16_t v = ((idx / (sample_rate / 100)) & 1) ? 30000 : -30000;  /* 每 320 帧翻转 */
+                buf[i * 2]     = v;
+                buf[i * 2 + 1] = v;
+            }
+            size_t wrote = MAX98357A_Write(buf, n);
+            if (wrote < (size_t)n) {
+                ESP_LOGE(STAG, "buzz write short: %u/%d", (unsigned)wrote, n);
+                ok = false;
+                break;
+            }
+            sent += n;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        /* --- 2) 音调测试: 440Hz 正弦 ±12000, 0.5s, 相位累加连续 + 淡入淡出 --- */
+        const float dphi = 2.0f * (float)M_PI * 440.0f / (float)sample_rate;
+        total = sample_rate / 2;
+        sent = 0;
+        float phase = 0.0f;
+        while (sent < total) {
+            int n = total - sent;
+            if (n > BEEP_CHUNK_FRAMES) {
+                n = BEEP_CHUNK_FRAMES;
+            }
+            for (int i = 0; i < n; i++) {
+                float env = 1.0f;
+                int idx = sent + i;
+                if (idx < fade_frames) {
+                    env = (float)idx / (float)(fade_frames - 1);
+                } else if (idx >= total - fade_frames) {
+                    env = (float)(total - 1 - idx) / (float)(fade_frames - 1);
+                }
+                int16_t v = (int16_t)(sinf(phase) * 12000.0f * env);
+                buf[i * 2]     = v;
+                buf[i * 2 + 1] = v;
+                phase += dphi;
+                if (phase >= 2.0f * (float)M_PI) {
+                    phase -= 2.0f * (float)M_PI;
+                }
+            }
+            size_t wrote = MAX98357A_Write(buf, n);
+            if (wrote < (size_t)n) {
+                ESP_LOGE(STAG, "tone write short: %u/%d", (unsigned)wrote, n);
+                ok = false;
+                break;
+            }
+            sent += n;
+        }
+        ESP_LOGI(STAG, "diag cycle %d %s (buzz+tone)", ++cycle, ok ? "done" : "FAILED");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
 void app_main(void)
 {
-    /* 串口只输出按键信息：屏蔽其他模块日志 */
+    /* 串口只输出音频相关日志：屏蔽其他模块日志 */
     esp_log_level_set("*", ESP_LOG_NONE);
-    esp_log_level_set("button", ESP_LOG_INFO);
+    esp_log_level_set("max98357a", ESP_LOG_INFO);
+    esp_log_level_set("spk_test", ESP_LOG_INFO);
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -508,6 +596,9 @@ void app_main(void)
 
     // Start OLED display task
     xTaskCreate(oled_task, "oled_task", 4096, NULL, 3, NULL);
+
+    // Start speaker test task
+    xTaskCreate(spk_test_task, "spk_test_task", 4096, NULL, 3, NULL);
 
     example_wifi_init();
     example_espnow_init();
