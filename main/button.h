@@ -21,12 +21,11 @@ extern "C" {
 #include <stdint.h>
 
 /* ===== 硬件配置（移植时修改此处） ===== */
-#define KEY_NUM               4
+#define KEY_NUM               3
 
 #define KEY_GPIO_1            GPIO_NUM_15
 #define KEY_GPIO_2            GPIO_NUM_16
 #define KEY_GPIO_3            GPIO_NUM_21
-#define KEY_GPIO_4            GPIO_NUM_9
 
 /* 时序参数 */
 #define KEY_DEBOUNCE_MS       20     /* 消抖时间 */
@@ -39,7 +38,6 @@ typedef enum {
     KEY_1 = 0,
     KEY_2 = 1,
     KEY_3 = 2,
-    KEY_4 = 3,
 } KeyId_t;
 
 typedef enum {

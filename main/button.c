@@ -34,7 +34,6 @@ static Key_t keys[KEY_NUM] = {
     { .gpio = KEY_GPIO_1, .state = ST_IDLE },
     { .gpio = KEY_GPIO_2, .state = ST_IDLE },
     { .gpio = KEY_GPIO_3, .state = ST_IDLE },
-    { .gpio = KEY_GPIO_4, .state = ST_IDLE },
 };
 
 void Key_Init(void)
@@ -42,8 +41,7 @@ void Key_Init(void)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << KEY_GPIO_1) |
                         (1ULL << KEY_GPIO_2) |
-                        (1ULL << KEY_GPIO_3) |
-                        (1ULL << KEY_GPIO_4),
+                        (1ULL << KEY_GPIO_3),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,

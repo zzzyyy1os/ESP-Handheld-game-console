@@ -17,9 +17,11 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <dirent.h>
 
 /* 喇叭音量 (0-100), 修改此处调音量 */
 #define SPK_TEST_VOLUME   5
+#define MP3_PLAY_VOLUME   50      /* MP3 播放音量 (0-100) */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -39,6 +41,8 @@
 #include "rocker.h"
 #include "button.h"
 #include "max98357a.h"
+#include "sdcard.h"
+#include "mp3play.h"
 
 #define ESPNOW_MAXDELAY 512
 
@@ -441,9 +445,9 @@ static void button_task(void *pvParameter)
         /* 每500ms打印一次按键引脚状态 (诊断用) */
         if (++status_cnt >= 50) {
             status_cnt = 0;
-            ESP_LOGI(BTN_TAG, "keys: %d %d %d %d",
+            ESP_LOGI(BTN_TAG, "keys: %d %d %d",
                 Key_IsPressed(KEY_1), Key_IsPressed(KEY_2),
-                Key_IsPressed(KEY_3), Key_IsPressed(KEY_4));
+                Key_IsPressed(KEY_3));
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -489,6 +493,7 @@ static void oled_task(void *pvParameter)
     }
 }
 
+#if 0 /* 诊断蜂鸣: 与 MP3 播放共用 I2S, 已由 mp3_play_task 替代; 需诊断时去掉 #if 0/#endif 并注释 mp3_play_task */
 /* 扬声器诊断任务 (fw v3): 每 5s 一轮 = 0.4s 50Hz 方波嗡嗡测试 + 0.5s 440Hz 音调测试 */
 static void spk_test_task(void *pvParameter)
 {
@@ -569,13 +574,134 @@ static void spk_test_task(void *pvParameter)
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
+#endif /* spk_test_task */
+
+/* MP3 播放任务: 待 SD 就绪后顺序播放根目录全部 .mp3, 播完循环列表 */
+static void mp3_play_task(void *pvParameter)
+{
+    static const char *STAG = "mp3_test";
+    char path[288];            /* "/sd/" + 长文件名 (FAT LFN 最长 255) + NUL */
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    MAX98357A_Init(44100);                  /* MP3 常见 44.1kHz, 播放中按码流自动热切换 */
+    MAX98357A_SetVolume(MP3_PLAY_VOLUME);
+    ESP_LOGI(STAG, "mp3 player start, vol=%d", MP3_PLAY_VOLUME);
+
+    while (1) {
+        if (!SD_IsReady()) {
+            ESP_LOGE(STAG, "SD not ready, wait 5s (mounting is done by sd_test_task)");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        DIR *dir = opendir(SD_MOUNT_POINT);
+        if (!dir) {
+            ESP_LOGE(STAG, "opendir %s failed", SD_MOUNT_POINT);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        int played = 0;
+        struct dirent *e;
+        while ((e = readdir(dir)) != NULL) {
+            const char *n = e->d_name;
+            size_t len = strlen(n);
+            /* 文件名以 .mp3 结尾 (不区分大小写) */
+            if (len < 4 || n[len - 4] != '.' ||
+                (n[len - 3] != 'm' && n[len - 3] != 'M') ||
+                (n[len - 2] != 'p' && n[len - 2] != 'P') || n[len - 1] != '3') {
+                continue;
+            }
+            snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, n);
+            ESP_LOGI(STAG, "play %s", path);
+            MAX98357A_SetVolume(MP3_PLAY_VOLUME);
+            MP3Play_PlayFile(path);
+            played++;
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        closedir(dir);
+
+        if (played == 0) {
+            ESP_LOGE(STAG, "no .mp3 found in %s, retry in 10s", SD_MOUNT_POINT);
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2000));   /* 列表播完, 停 2s 循环重播 */
+        }
+    }
+}
+
+/* SD 卡测试任务: 挂载后列出根目录 + 写/读测试文件, 之后每 10s 重复巡检 */
+static void sd_test_task(void *pvParameter)
+{
+    static const char *STAG = "sd_test";
+    char path[64];
+
+    vTaskDelay(pdMS_TO_TICKS(2000));   /* 等系统稳定 */
+    SD_Init();
+
+    while (1) {
+        if (!SD_IsReady()) {
+            ESP_LOGE(STAG, "SD not ready, retry in 5s (insert card / check wiring)");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            SD_Init();
+            continue;
+        }
+
+        /* 1) 列出根目录 */
+        DIR *dir = opendir(SD_MOUNT_POINT);
+        if (dir) {
+            struct dirent *e;
+            int n = 0;
+            while ((e = readdir(dir)) != NULL && n < 20) {
+                ESP_LOGI(STAG, "  %s %s", (e->d_type == DT_DIR) ? "[DIR ]" : "[FILE]", e->d_name);
+                n++;
+            }
+            closedir(dir);
+            ESP_LOGI(STAG, "root listing done (%d entries)", n);
+        } else {
+            ESP_LOGE(STAG, "opendir %s failed", SD_MOUNT_POINT);
+        }
+
+        /* 2) 写测试文件 */
+        snprintf(path, sizeof(path), "%s/test.txt", SD_MOUNT_POINT);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "hello espnow-1 sd test\n");
+            fclose(f);
+            ESP_LOGI(STAG, "wrote %s", path);
+        } else {
+            ESP_LOGE(STAG, "open %s for write failed", path);
+        }
+
+        /* 3) 读回验证 */
+        f = fopen(path, "r");
+        if (f) {
+            char line[64] = {0};
+            if (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\r\n")] = 0;
+                ESP_LOGI(STAG, "read back: \"%s\"", line);
+            } else {
+                ESP_LOGE(STAG, "read %s failed", path);
+            }
+            fclose(f);
+        } else {
+            ESP_LOGE(STAG, "open %s for read failed", path);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
 
 void app_main(void)
 {
-    /* 串口只输出音频相关日志：屏蔽其他模块日志 */
+    /* 串口只输出音频/SD 相关日志：屏蔽其他模块日志 */
     esp_log_level_set("*", ESP_LOG_NONE);
     esp_log_level_set("max98357a", ESP_LOG_INFO);
     esp_log_level_set("spk_test", ESP_LOG_INFO);
+    esp_log_level_set("sdcard", ESP_LOG_INFO);
+    esp_log_level_set("sd_test", ESP_LOG_INFO);
+    esp_log_level_set("mp3play", ESP_LOG_INFO);
+    esp_log_level_set("mp3_test", ESP_LOG_INFO);
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -598,7 +724,13 @@ void app_main(void)
     xTaskCreate(oled_task, "oled_task", 4096, NULL, 3, NULL);
 
     // Start speaker test task
-    xTaskCreate(spk_test_task, "spk_test_task", 4096, NULL, 3, NULL);
+    // xTaskCreate(spk_test_task, "spk_test_task", 4096, NULL, 3, NULL);   // 诊断蜂鸣停用 (I2S 交给 MP3)
+
+    // Start MP3 play task
+    xTaskCreate(mp3_play_task, "mp3_play_task", 8192, NULL, 3, NULL);
+
+    // Start SD card test task
+    xTaskCreate(sd_test_task, "sd_test_task", 4096, NULL, 3, NULL);
 
     example_wifi_init();
     example_espnow_init();
