@@ -37,15 +37,18 @@
 #include "esp_crc.h"
 #include "espnow_example.h"
 #include "driver/i2c_master.h"
+#include "esp_system.h"
 #include "oled.h"
 #include "rocker.h"
 #include "button.h"
 #include "max98357a.h"
 #include "sdcard.h"
 #include "mp3play.h"
+#include "lcd.h"
 
 #define ESPNOW_MAXDELAY 512
 
+#if 0 /* 只测显示屏: WiFi/ESPNOW 停用 (恢复: 删本行与下方对应 #endif, 并恢复 app_main 里的调用) */
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
@@ -390,8 +393,12 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
     s_example_espnow_queue = NULL;
     esp_now_deinit();
 }
+#endif /* 只测显示屏: WiFi/ESPNOW 停用 */
 
 /* ========== I2C & OLED ========== */
+#if 0 /* OLED 与 LCD 引脚冲突: OLED SDA=GPIO3 = LCD_RST=GPIO3, 二者只能启用一个。
+         启用 LCD 测试(lcd_test_task)时关闭 OLED; 要用 OLED 时恢复本段及下方
+         oled_task / oled_i2c_init() 调用, 并注释 lcd_test_task 的 xTaskCreate */
 #define OLED_I2C_PORT       I2C_NUM_1
 #define OLED_I2C_SDA_IO     3
 #define OLED_I2C_SCL_IO     4
@@ -412,8 +419,10 @@ static void oled_i2c_init(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &oled_i2c_bus_handle));
     ESP_LOGI(TAG, "I2C initialized: SDA=GPIO%d, SCL=GPIO%d", OLED_I2C_SDA_IO, OLED_I2C_SCL_IO);
 }
+#endif /* OLED I2C */
 
 /* 摇杆采样任务 */
+#if 0 /* 只测显示屏, 外设停用 (要恢复: 去掉本行与对应 #endif, 并恢复 app_main 里的 xTaskCreate) */
 static void rocker_task(void *pvParameter)
 {
     rocker_value_t val;
@@ -453,8 +462,10 @@ static void button_task(void *pvParameter)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
+#endif /* rocker_task + button_task */
 
 /* OLED显示任务 */
+#if 0 /* GPIO3 冲突, 同上: 启用 LCD 时关闭 OLED */
 static void oled_task(void *pvParameter)
 {
     /* Wait for OLED power stable */
@@ -490,6 +501,113 @@ static void oled_task(void *pvParameter)
 
         OLED_Display();
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+#endif /* oled_task */
+
+/* LCD 测试任务: 分层点亮 (背光诊断 → 初始化 → 白屏/灰阶判定 → 轮播测试画面)。
+   只测显示屏, 不用 SD/摇杆/按键等外设。串口 tag: lcd_test */
+static void lcd_test_task(void *pvParameter)
+{
+    static const char *LTAG = "lcd_test";
+
+    vTaskDelay(pdMS_TO_TICKS(1000));   /* 等系统稳定 */
+
+    /* phase 0: 背光诊断 (纯 GPIO/LEDC, 不依赖 SPI/初始化), ~10s
+       肉眼观察哪一档亮, 回填 lcd.h 的 LCD_BCKL_INVERT/LCD_BCKL_MODE;
+       全不亮 → 硬件问题 (GND 共地/BLK 线/供电/FPC), 停止查初始化 */
+    ESP_LOGI(LTAG, "phase 0: backlight diag (~10s)");
+    LCD_BacklightDiag();
+
+    LCD_Init();
+    LCD_Clear(LCD_BLACK);
+    LCD_Sync();
+    vTaskDelay(pdMS_TO_TICKS(80));     /* 清屏完成再开背光 (retro-go 经验值) */
+    LCD_SetBacklight(LCD_BRIGHTNESS);
+
+    /* phase 1: 白屏判定页 — 背光亮 + 此页黑/灰 → 试 lcd.h LCD_INVON; 面板活着的标准 */
+    ESP_LOGI(LTAG, "phase 1: white screen (panel alive if not black)");
+    LCD_Clear(LCD_WHITE);
+    LCD_ShowString(8, 8, "WHITE SCREEN", LCD_BLACK, LCD_WHITE, 2);
+    LCD_Sync();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* phase 1b: 灰阶 — 有明暗渐变 = SPI 通信正常; 无渐变且全黑 = 没信号 */
+    ESP_LOGI(LTAG, "phase 1b: gray gradient (check brightness steps)");
+    for (int i = 0; i < 16; i++) {
+        uint8_t v = (uint8_t)(i * 17);
+        LCD_FillRect(0, i * 15, LCD_WIDTH, 15, LCD_RGB565(v, v, v));
+    }
+    LCD_ShowString(8, 8, "GRAYSCALE", LCD_RED, LCD_BLACK, 2);
+    LCD_Sync();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* 开机画面 */
+    LCD_ShowString(46, 70, "espnow-1 LCD TEST", LCD_CYAN, LCD_BLACK, 2);
+    LCD_ShowString(94, 110, "ST7789 320x240", LCD_WHITE, LCD_BLACK, 1);
+    LCD_ShowString(70, 130, "BOE3.2 seq @1MHz bring-up", LCD_GRAY, LCD_BLACK, 1);
+    LCD_Sync();
+    ESP_LOGI(LTAG, "init ok, start test loop");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    while (1) {
+        /* 1) 纯色轮播: 查花屏/无显示/坏点 */
+        static const struct { uint16_t c; const char *n; } solids[] = {
+            {LCD_RED, "RED"}, {LCD_GREEN, "GREEN"}, {LCD_BLUE, "BLUE"},
+            {LCD_WHITE, "WHITE"}, {LCD_BLACK, "BLACK"},
+        };
+        ESP_LOGI(LTAG, "phase 2: solid colors");
+        for (int i = 0; i < 5; i++) {
+            uint16_t text = (solids[i].c == LCD_WHITE) ? LCD_BLACK : LCD_WHITE;
+            LCD_Clear(solids[i].c);
+            LCD_ShowString(8, 8, solids[i].n, text, solids[i].c, 2);
+            LCD_Sync();
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        /* 2) 8 色竖条: 查 RGB/BGR 顺序与方向 (红蓝互换时改 lcd.h LCD_RGB_BGR) */
+        static const uint16_t bars[8] = {
+            LCD_BLACK, LCD_BLUE, LCD_GREEN, LCD_CYAN,
+            LCD_RED, LCD_MAGENTA, LCD_YELLOW, LCD_WHITE,
+        };
+        ESP_LOGI(LTAG, "phase 3: color bars");
+        for (int i = 0; i < 8; i++) {
+            LCD_FillRect(i * 40, 0, 40, LCD_HEIGHT, bars[i]);
+        }
+        LCD_ShowString(8, 8, "COLOR BARS", LCD_WHITE, LCD_BLACK, 2);
+        LCD_Sync();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        /* 3) 灰阶横条: 查反显 (梯度黑白颠倒时改 lcd.h LCD_INVON) */
+        ESP_LOGI(LTAG, "phase 4: gray gradient");
+        for (int i = 0; i < 16; i++) {
+            uint8_t v = (uint8_t)(i * 17);
+            LCD_FillRect(0, i * 15, LCD_WIDTH, 15, LCD_RGB565(v, v, v));
+        }
+        LCD_ShowString(8, 8, "GRAYSCALE", LCD_RED, LCD_BLACK, 2);
+        LCD_Sync();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        /* 4) 棋盘: 查显示偏移/对齐 */
+        ESP_LOGI(LTAG, "phase 5: checkerboard");
+        for (int y = 0; y < LCD_HEIGHT; y += 16) {
+            for (int x = 0; x < LCD_WIDTH; x += 16) {
+                LCD_FillRect(x, y, 16, 16, ((x / 16 + y / 16) & 1) ? LCD_WHITE : LCD_BLACK);
+            }
+        }
+        LCD_ShowString(8, 8, "CHECKER", LCD_RED, LCD_BLACK, 2);
+        LCD_Sync();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        /* 5) 文字 3 档字号 */
+        ESP_LOGI(LTAG, "phase 6: text");
+        LCD_Clear(LCD_RGB565(0, 0, 64));
+        LCD_ShowString(8, 8,  "ABCDEFGHIJKLM", LCD_WHITE, LCD_RGB565(0, 0, 64), 1);
+        LCD_ShowString(8, 24, "NOPQRSTUVWXYZ", LCD_YELLOW, LCD_RGB565(0, 0, 64), 1);
+        LCD_ShowString(8, 48, "0123456789 +-*/", LCD_GREEN, LCD_RGB565(0, 0, 64), 2);
+        LCD_ShowString(8, 88, "Hello LCD!", LCD_CYAN, LCD_RGB565(0, 0, 64), 3);
+        LCD_Sync();
+        vTaskDelay(pdMS_TO_TICKS(2500));
     }
 }
 
@@ -577,6 +695,7 @@ static void spk_test_task(void *pvParameter)
 #endif /* spk_test_task */
 
 /* MP3 播放任务: 待 SD 就绪后顺序播放根目录全部 .mp3, 播完循环列表 */
+#if 0 /* 只测显示屏, SD/音频停用 (要恢复: 去掉本行与对应 #endif, 并恢复 app_main 里的 xTaskCreate) */
 static void mp3_play_task(void *pvParameter)
 {
     static const char *STAG = "mp3_test";
@@ -691,17 +810,14 @@ static void sd_test_task(void *pvParameter)
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
+#endif /* mp3_play_task + sd_test_task */
 
 void app_main(void)
 {
-    /* 串口只输出音频/SD 相关日志：屏蔽其他模块日志 */
+    /* 只测显示屏: 串口仅输出 LCD 日志 (其他模块任务已停用, 日志顺带屏蔽) */
     esp_log_level_set("*", ESP_LOG_NONE);
-    esp_log_level_set("max98357a", ESP_LOG_INFO);
-    esp_log_level_set("spk_test", ESP_LOG_INFO);
-    esp_log_level_set("sdcard", ESP_LOG_INFO);
-    esp_log_level_set("sd_test", ESP_LOG_INFO);
-    esp_log_level_set("mp3play", ESP_LOG_INFO);
-    esp_log_level_set("mp3_test", ESP_LOG_INFO);
+    esp_log_level_set("lcd", ESP_LOG_INFO);
+    esp_log_level_set("lcd_test", ESP_LOG_INFO);
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -712,26 +828,45 @@ void app_main(void)
     ESP_ERROR_CHECK( ret );
 
     // Initialize I2C for OLED
+#if 0 /* GPIO3 冲突 (OLED SDA=LCD_RST=3), 启用 LCD 时关闭 OLED */
     oled_i2c_init();
+#endif
 
     // Start rocker sampling task
+#if 0 /* 只测显示屏, 外设停用 (rocker ADC 与 LCD 无冲突, 要用时恢复) */
     xTaskCreate(rocker_task, "rocker_task", 4096, NULL, 5, NULL);
+#endif
 
     // Start button scan task
+#if 0 /* 只测显示屏, 外设停用 */
     xTaskCreate(button_task, "button_task", 3072, NULL, 5, NULL);
+#endif
 
     // Start OLED display task
+#if 0 /* GPIO3 冲突, 同上 */
     xTaskCreate(oled_task, "oled_task", 4096, NULL, 3, NULL);
+#endif
+
+    // Start LCD test task (ST7789 320x240, spi_task 线程由 LCD_Init 创建)
+    xTaskCreate(lcd_test_task, "lcd_test_task", 6144, NULL, 3, NULL);
 
     // Start speaker test task
-    // xTaskCreate(spk_test_task, "spk_test_task", 4096, NULL, 3, NULL);   // 诊断蜂鸣停用 (I2S 交给 MP3)
+#if 0 /* 只测显示屏, 音频停用 */
+    // xTaskCreate(spk_test_task, "spk_test_task", 4096, NULL, 3, NULL);
+#endif
 
     // Start MP3 play task
+#if 0 /* 只测显示屏, SD/音频停用 */
     xTaskCreate(mp3_play_task, "mp3_play_task", 8192, NULL, 3, NULL);
+#endif
 
     // Start SD card test task
+#if 0 /* 只测显示屏, SD 停用 */
     xTaskCreate(sd_test_task, "sd_test_task", 4096, NULL, 3, NULL);
+#endif
 
+#if 0 /* 只测显示屏, 网络停用 (省电流, 排除射频干扰) */
     example_wifi_init();
     example_espnow_init();
+#endif
 }
